@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+quality_report.json
+evidence/runs/
+.DS_Store

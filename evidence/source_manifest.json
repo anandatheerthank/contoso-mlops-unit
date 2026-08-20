@@ -1,0 +1,15 @@
+{
+  "dataset": "contoso_sales_daily",
+  "storage_account": "<your-storage-account>",
+  "container": "raw",
+  "path": "sales/ingest_date=<yyyy-MM-dd>/snapshot=001/sales_daily.csv",
+  "ingest_date": "<yyyy-MM-dd>",
+  "snapshot": "001",
+  "blob_last_modified": "<paste from blob Properties>",
+  "blob_etag": "<paste from blob Properties>",
+  "blob_version_id": "<paste from blob Properties>",
+  "record_count": 1000,
+  "recorded_by": "<your email>",
+  "overwrite_policy": "new snapshot folder per load; blob versioning enabled",
+  "owner": "retail-data-team"
+}

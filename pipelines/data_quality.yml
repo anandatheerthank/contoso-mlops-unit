@@ -1,0 +1,164 @@
+trigger:
+  branches:
+    include:
+      - main
+      - feature/data-quality-foundation
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: mlops-unit2-secrets        # Key Vault-linked: databricks-token
+  - name: storageAccount
+    value: 'stcontosomlopsXX'          # <-- your ADLS Gen2 account name
+  - name: ingestDate
+    value: '2026-08-20'
+  - name: snapshot
+    value: '001'                       # '002' for the Task 8 failure demo
+  - name: dataOwner
+    value: 'retail-data-team'
+  - name: databricksHost
+    value: 'https://adb-0000000000000000.0.azuredatabricks.net'
+  - name: databricksClusterId
+    value: '0000-000000-xxxxxxxx'
+  - name: databricksNotebookPath
+    value: '/Repos/<your-upn>/contoso-mlops-unit2/databricks/notebooks/ingest_validate'
+  - name: azureServiceConnection
+    value: 'sc-mlops-unit2'
+  - name: azureSubscriptionId
+    value: '00000000-0000-0000-0000-000000000000'
+  - name: resourceGroup
+    value: 'rg-mlops-unit2'
+  - name: amlWorkspace
+    value: 'mlw-mlops-unit2'
+
+stages:
+
+# ---------------------------------------------------------------- Stage 1 ----
+- stage: Test
+  displayName: '1 - Unit tests'
+  jobs:
+    - job: RunTests
+      steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.11'
+        - script: |
+            python -m pip install --upgrade pip
+            pip install pandas pytest pytest-cov requests
+          displayName: 'Install test dependencies'
+        - script: python -m pytest tests -v --junitxml=test-results.xml
+          displayName: 'Run data-quality unit tests'
+        - task: PublishTestResults@2
+          condition: succeededOrFailed()
+          inputs:
+            testResultsFiles: 'test-results.xml'
+            testRunTitle: 'Data-quality validation tests'
+
+# ---------------------------------------------------------------- Stage 2 ----
+- stage: SubmitDatabricksJob
+  displayName: '2 - Databricks ingest & validate'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+    - job: Submit
+      timeoutInMinutes: 40
+      steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.11'
+        - script: pip install requests
+          displayName: 'Install dependencies'
+        - script: python src/run_databricks_job.py $(Build.ArtifactStagingDirectory)/quality_report.json
+          displayName: 'Submit notebook run and collect quality report'
+          env:
+            DATABRICKS_HOST: $(databricksHost)
+            DATABRICKS_TOKEN: $(databricks-token)        # from Key Vault, masked in logs
+            DATABRICKS_CLUSTER_ID: $(databricksClusterId)
+            DATABRICKS_NOTEBOOK_PATH: $(databricksNotebookPath)
+            STORAGE_ACCOUNT: $(storageAccount)
+            INGEST_DATE: $(ingestDate)
+            SNAPSHOT: $(snapshot)
+            DATA_OWNER: $(dataOwner)
+            BUILD_BUILDID: $(Build.BuildId)
+            BUILD_SOURCEVERSION: $(Build.SourceVersion)
+        - publish: $(Build.ArtifactStagingDirectory)/quality_report.json
+          artifact: quality-report
+          displayName: 'Publish quality report'
+
+# ---------------------------------------------------------------- Stage 3 ----
+- stage: QualityGate
+  displayName: '3 - Quality gate (>= 98% valid, 100% schema)'
+  dependsOn: SubmitDatabricksJob
+  condition: succeeded()
+  jobs:
+    - job: Gate
+      steps:
+        - checkout: self
+        - download: current
+          artifact: quality-report
+        - script: python src/check_quality_gate.py $(Pipeline.Workspace)/quality-report/quality_report.json
+          displayName: 'Evaluate quality gate'
+
+# ---------------------------------------------------------------- Stage 4 ----
+- stage: RegisterAmlAsset
+  displayName: '4 - Register Azure ML data asset'
+  dependsOn: QualityGate
+  condition: succeeded()                 # runs ONLY when the gate passed
+  jobs:
+    - job: Register
+      steps:
+        - checkout: self
+        - download: current
+          artifact: quality-report
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '3.11'
+        - script: pip install azure-ai-ml azure-identity
+          displayName: 'Install Azure ML SDK v2'
+        - task: AzureCLI@2
+          displayName: 'Register versioned data asset'
+          inputs:
+            azureSubscription: $(azureServiceConnection)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              python src/register_data_asset.py \
+                "$(Pipeline.Workspace)/quality-report/quality_report.json"
+          env:
+            AZURE_SUBSCRIPTION_ID: $(azureSubscriptionId)
+            AZURE_RESOURCE_GROUP: $(resourceGroup)
+            AZURE_ML_WORKSPACE: $(amlWorkspace)
+
+# ---------------------------------------------------------------- Stage 5 ----
+- stage: PublishEvidence
+  displayName: '5 - Publish evidence'
+  dependsOn:
+    - SubmitDatabricksJob
+    - QualityGate
+    - RegisterAmlAsset
+  condition: always()                    # evidence is published pass or fail
+  jobs:
+    - job: Evidence
+      steps:
+        - download: current
+          artifact: quality-report
+        - script: |
+            mkdir -p evidence
+            cp "$(Pipeline.Workspace)/quality-report/quality_report.json" evidence/
+            cat > evidence/run_manifest.json <<EOF
+            {
+              "git_commit": "$(Build.SourceVersion)",
+              "git_branch": "$(Build.SourceBranchName)",
+              "azure_devops_run_id": "$(Build.BuildId)",
+              "azure_devops_run_url": "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+              "source_snapshot": "sales/ingest_date=$(ingestDate)/snapshot=$(snapshot)",
+              "requested_by": "$(Build.RequestedFor)",
+              "quality_gate_result": "$(Agent.JobStatus)"
+            }
+            EOF
+            cat evidence/run_manifest.json
+          displayName: 'Assemble evidence bundle'
+        - publish: evidence
+          artifact: evidence-bundle
+          displayName: 'Publish evidence bundle'
