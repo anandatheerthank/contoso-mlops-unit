@@ -2,7 +2,6 @@ trigger:
   branches:
     include:
       - main
-      - feature/data-quality-foundation
 
 pool:
   vmImage: ubuntu-latest
